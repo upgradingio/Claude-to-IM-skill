@@ -1,6 +1,6 @@
 # Claude-to-IM Skill
 
-将 Claude Code 桥接到 IM 平台 —— 在 Telegram、Discord 或飞书中与 Claude 对话。
+将 Claude Code / Codex 桥接到 IM 平台 —— 在 Telegram、Discord 或飞书中与 AI 编程代理对话。
 
 [English](README.md)
 
@@ -10,7 +10,7 @@
 
 ## 工作原理
 
-本 Skill 运行一个后台守护进程，将你的 IM 机器人连接到 Claude Code 会话。来自 IM 的消息被转发给 Claude Code，响应（包括工具调用、权限请求、流式预览）会发回到聊天中。
+本 Skill 运行一个后台守护进程，将你的 IM 机器人连接到 Claude Code 或 Codex 会话。来自 IM 的消息被转发给 AI 编程代理，响应（包括工具调用、权限请求、流式预览）会发回到聊天中。
 
 ```
 你 (Telegram/Discord/飞书)

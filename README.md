@@ -1,6 +1,6 @@
 # Claude-to-IM Skill
 
-Bridge Claude Code to IM platforms — chat with Claude from Telegram, Discord, or Feishu/Lark.
+Bridge Claude Code / Codex to IM platforms — chat with AI coding agents from Telegram, Discord, or Feishu/Lark.
 
 [中文文档](README_CN.md)
 
@@ -10,7 +10,7 @@ Bridge Claude Code to IM platforms — chat with Claude from Telegram, Discord, 
 
 ## How It Works
 
-This skill runs a background daemon that connects your IM bots to Claude Code sessions. Messages from IM are forwarded to Claude Code, and responses (including tool use, permission requests, streaming previews) are sent back to your chat.
+This skill runs a background daemon that connects your IM bots to Claude Code or Codex sessions. Messages from IM are forwarded to the AI coding agent, and responses (including tool use, permission requests, streaming previews) are sent back to your chat.
 
 ```
 You (Telegram/Discord/Feishu)
