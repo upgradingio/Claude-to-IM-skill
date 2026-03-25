@@ -3,12 +3,17 @@
  *
  * Converts SDK stream events into the SSE format expected by
  * the claude-to-im bridge conversation engine.
+ *
+ * Uses the v2 persistent session API (unstable_v2_createSession /
+ * unstable_v2_resumeSession) to keep a long-lived claude subprocess alive
+ * between messages, eliminating the cold-start overhead of spawning a new
+ * process for every turn.
  */
 
 import fs from 'node:fs';
 import { execSync } from 'node:child_process';
-import { query } from '@anthropic-ai/claude-agent-sdk';
-import type { SDKMessage, PermissionResult } from '@anthropic-ai/claude-agent-sdk';
+import { query, unstable_v2_createSession, unstable_v2_resumeSession } from '@anthropic-ai/claude-agent-sdk';
+import type { SDKMessage, PermissionResult, SDKSession } from '@anthropic-ai/claude-agent-sdk';
 import type { LLMProvider, StreamChatParams, FileAttachment } from 'claude-to-im/src/lib/bridge/host.js';
 import type { PendingPermissions } from './permission-gateway.js';
 
@@ -423,157 +428,182 @@ export class SDKLLMProvider implements LLMProvider {
   private cliPath: string | undefined;
   private autoApprove: boolean;
 
+  /**
+   * Persistent session cache keyed by "<workingDir>|<sdkSessionId>".
+   * Reusing the same claude subprocess across messages eliminates the
+   * cold-start cost (~0.6–1.4s) and avoids resending the full session
+   * history on every turn.
+   */
+  private sessions = new Map<string, SDKSession>();
+
   constructor(private pendingPerms: PendingPermissions, cliPath?: string, autoApprove = false) {
     this.cliPath = cliPath;
     this.autoApprove = autoApprove;
   }
 
-  streamChat(params: StreamChatParams): ReadableStream<string> {
+  /**
+   * Build the session options shared between createSession and resumeSession.
+   * `canUseTool` is bound to the controller passed in so permission requests
+   * stream back to the caller during the active turn.
+   */
+  private buildSessionOptions(
+    params: StreamChatParams,
+    controller: ReadableStreamDefaultController<string>,
+  ): Record<string, unknown> {
     const pendingPerms = this.pendingPerms;
-    const cliPath = this.cliPath;
     const autoApprove = this.autoApprove;
+    const cleanEnv = buildSubprocessEnv();
+
+    let model = params.model;
+    if (isNonClaudeModel(model)) {
+      console.warn(`[llm-provider] Ignoring non-Claude model "${model}", using CLI default`);
+      model = undefined;
+    }
+    const passModel = !!process.env.CTI_DEFAULT_MODEL;
+    if (model && !passModel) {
+      console.log(`[llm-provider] Skipping model "${model}", using CLI default (set CTI_DEFAULT_MODEL to override)`);
+      model = undefined;
+    }
+
+    const opts: Record<string, unknown> = {
+      model: model ?? process.env.CTI_DEFAULT_MODEL ?? 'claude-sonnet-4-6',
+      cwd: params.workingDirectory,
+      permissionMode: (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
+      env: cleanEnv,
+      canUseTool: async (
+        toolName: string,
+        input: Record<string, unknown>,
+        toolOpts: { toolUseID: string; suggestions?: string[] },
+      ): Promise<PermissionResult> => {
+        if (autoApprove) {
+          return { behavior: 'allow' as const, updatedInput: input };
+        }
+        controller.enqueue(
+          sseEvent('permission_request', {
+            permissionRequestId: toolOpts.toolUseID,
+            toolName,
+            toolInput: input,
+            suggestions: toolOpts.suggestions || [],
+          }),
+        );
+        const result = await pendingPerms.waitFor(toolOpts.toolUseID);
+        if (result.behavior === 'allow') {
+          return { behavior: 'allow' as const, updatedInput: input };
+        }
+        return { behavior: 'deny' as const, message: result.message || 'Denied by user' };
+      },
+    };
+    if (this.cliPath) {
+      opts.pathToClaudeCodeExecutable = this.cliPath;
+    }
+    return opts;
+  }
+
+  /**
+   * Get or create a persistent SDKSession for the given params.
+   * On first call: resumes the existing SDK session if `sdkSessionId` is set,
+   * otherwise creates a fresh one. On subsequent calls: returns the cached session.
+   */
+  private getOrCreateSession(
+    sessionKey: string,
+    params: StreamChatParams,
+    controller: ReadableStreamDefaultController<string>,
+  ): SDKSession {
+    const existing = this.sessions.get(sessionKey);
+    if (existing) return existing;
+
+    const opts = this.buildSessionOptions(params, controller);
+
+    let session: SDKSession;
+    if (params.sdkSessionId) {
+      console.log(`[llm-provider] Resuming persistent session ${params.sdkSessionId}`);
+      session = unstable_v2_resumeSession(
+        params.sdkSessionId,
+        opts as Parameters<typeof unstable_v2_resumeSession>[1],
+      );
+    } else {
+      console.log('[llm-provider] Creating new persistent session');
+      session = unstable_v2_createSession(
+        opts as Parameters<typeof unstable_v2_createSession>[0],
+      );
+    }
+
+    this.sessions.set(sessionKey, session);
+    return session;
+  }
+
+  /** Remove a session from the cache and close it. */
+  private evictSession(sessionKey: string): void {
+    const s = this.sessions.get(sessionKey);
+    if (s) {
+      this.sessions.delete(sessionKey);
+      try { s.close(); } catch { /* ignore */ }
+    }
+  }
+
+  streamChat(params: StreamChatParams): ReadableStream<string> {
+    // Key combines workingDir + sdkSessionId so different sessions / CWDs
+    // never share a process.
+    const sessionKey = `${params.workingDirectory ?? ''}|${params.sdkSessionId ?? ''}`;
 
     return new ReadableStream({
-      start(controller) {
+      start: (controller) => {
         (async () => {
-          // Ring-buffer for recent stderr output (max 4 KB)
-          const MAX_STDERR = 4096;
-          let stderrBuf = '';
           const state: StreamState = { hasReceivedResult: false, hasStreamedText: false, lastAssistantText: '' };
 
           try {
-            const cleanEnv = buildSubprocessEnv();
-
-            // Cross-runtime migration safety: drop non-Claude model names
-            // that may linger in session data from a previous Codex runtime.
-            let model = params.model;
-            if (isNonClaudeModel(model)) {
-              console.warn(`[llm-provider] Ignoring non-Claude model "${model}", using CLI default`);
-              model = undefined;
-            }
-
-            // Only pass model to CLI if explicitly configured via CTI_DEFAULT_MODEL.
-            // Letting the CLI choose its own default avoids exit-code-1 failures
-            // when a stored model is inaccessible on the current machine/plan.
-            const passModel = !!process.env.CTI_DEFAULT_MODEL;
-            if (model && !passModel) {
-              console.log(`[llm-provider] Skipping model "${model}", using CLI default (set CTI_DEFAULT_MODEL to override)`);
-              model = undefined;
-            }
-
-            const queryOptions: Record<string, unknown> = {
-              cwd: params.workingDirectory,
-              model,
-              resume: params.sdkSessionId || undefined,
-              abortController: params.abortController,
-              permissionMode: (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
-              includePartialMessages: true,
-              env: cleanEnv,
-              stderr: (data: string) => {
-                stderrBuf += data;
-                if (stderrBuf.length > MAX_STDERR) {
-                  stderrBuf = stderrBuf.slice(-MAX_STDERR);
-                }
-              },
-              canUseTool: async (
-                  toolName: string,
-                  input: Record<string, unknown>,
-                  opts: { toolUseID: string; suggestions?: string[] },
-                ): Promise<PermissionResult> => {
-                  // Auto-approve if configured (useful for channels without
-                  // interactive permission UI, e.g. Feishu WebSocket mode)
-                  if (autoApprove) {
-                    return { behavior: 'allow' as const, updatedInput: input };
-                  }
-
-                  // Emit permission_request SSE event for the bridge
-                  controller.enqueue(
-                    sseEvent('permission_request', {
-                      permissionRequestId: opts.toolUseID,
-                      toolName,
-                      toolInput: input,
-                      suggestions: opts.suggestions || [],
-                    }),
-                  );
-
-                  // Block until IM user responds
-                  const result = await pendingPerms.waitFor(opts.toolUseID);
-
-                  if (result.behavior === 'allow') {
-                    return { behavior: 'allow' as const, updatedInput: input };
-                  }
-                  return {
-                    behavior: 'deny' as const,
-                    message: result.message || 'Denied by user',
-                  };
-                },
-            };
-            if (cliPath) {
-              queryOptions.pathToClaudeCodeExecutable = cliPath;
-            }
+            let session = this.getOrCreateSession(sessionKey, params, controller);
 
             const prompt = buildPrompt(params.prompt, params.files);
-            const q = query({
-              prompt: prompt as Parameters<typeof query>[0]['prompt'],
-              options: queryOptions as Parameters<typeof query>[0]['options'],
-            });
+            // For multi-modal prompts the SDK accepts an SDKUserMessage; for
+            // plain text a string is fine.
+            const msgToSend = typeof prompt === 'string'
+              ? prompt
+              : await (async () => { for await (const m of prompt) return m; })();
 
-            for await (const msg of q) {
+            await session.send(msgToSend as string);
+
+            for await (const msg of session.stream()) {
               handleMessage(msg, controller, state);
+              // stream() yields until the result message arrives
+              if (state.hasReceivedResult) break;
+            }
+
+            if (!state.hasStreamedText && state.lastAssistantText) {
+              controller.enqueue(sseEvent('text', state.lastAssistantText));
             }
 
             controller.close();
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            console.error('[llm-provider] SDK query error:', err instanceof Error ? err.stack || err.message : err);
-            if (stderrBuf) {
-              console.error('[llm-provider] stderr from CLI:', stderrBuf.trim());
-            }
+            console.error('[llm-provider] SDK session error:', err instanceof Error ? err.stack || err.message : err);
+
+            // Evict the broken session so the next message gets a fresh one.
+            this.evictSession(sessionKey);
 
             const isTransportExit = message.includes('process exited with code');
 
-            // ── Case 1: Result already received ──
-            // The SDK delivered a proper result (success or structured error).
-            // A trailing "process exited with code 1" is transport teardown noise.
             if (state.hasReceivedResult && isTransportExit) {
               console.log('[llm-provider] Suppressing transport error — result already received');
               controller.close();
               return;
             }
 
-            // ── Case 2: Recognised business error in assistant text ──
-            // The CLI returned an assistant message with text that matches
-            // a known auth/access error pattern (e.g. "Your organization
-            // does not have access to Claude"). Forward it as-is — it's
-            // more informative than the generic transport error.
-            // Only activate when the text is a recognised error; otherwise
-            // a normal response that crashed before result would be silently
-            // presented as if it succeeded.
             if (state.lastAssistantText && classifyAuthError(state.lastAssistantText)) {
               controller.enqueue(sseEvent('text', state.lastAssistantText));
               controller.close();
               return;
             }
 
-            // ── Case 3: Partial output + crash ──
-            // Text was streamed but no result arrived — the response was
-            // truncated by a real crash. Always emit an error so the user
-            // knows the output is incomplete.
-
-            // ── Build user-facing error message ──
-            const authKind = classifyAuthError(message) || classifyAuthError(stderrBuf);
+            const authKind = classifyAuthError(message);
             let userMessage: string;
             if (authKind === 'cli') {
               userMessage = CLI_AUTH_USER_MESSAGE;
             } else if (authKind === 'api') {
               userMessage = API_AUTH_USER_MESSAGE;
             } else if (isTransportExit) {
-              const stderrSummary = stderrBuf.trim();
-              const lines = [message];
-              if (stderrSummary) {
-                lines.push('', 'CLI stderr:', stderrSummary.slice(-1024));
-              }
-              lines.push(
+              userMessage = [
+                message,
                 '',
                 'Possible causes:',
                 '• Claude CLI not authenticated — run: claude auth login',
@@ -581,8 +611,7 @@ export class SDKLLMProvider implements LLMProvider {
                 '• Missing ANTHROPIC_* env vars in daemon — check config.env',
                 '',
                 'Run `/claude-to-im doctor` to diagnose.',
-              );
-              userMessage = lines.join('\n');
+              ].join('\n');
             } else {
               userMessage = message;
             }
