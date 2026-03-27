@@ -424,34 +424,93 @@ export interface StreamState {
   lastAssistantText: string;
 }
 
+/** TTL for idle sessions: 30 minutes of inactivity triggers auto-close. */
+const SESSION_TTL_MS = 30 * 60 * 1000;
+
+/** How often the TTL sweeper runs. */
+const SESSION_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
+interface SessionEntry {
+  session: SDKSession;
+  /** Timestamp of last send() call. */
+  lastUsed: number;
+}
+
 export class SDKLLMProvider implements LLMProvider {
   private cliPath: string | undefined;
   private autoApprove: boolean;
 
   /**
-   * Persistent session cache keyed by "<workingDir>|<sdkSessionId>".
+   * Persistent session cache keyed by bridge sessionId.
+   *
+   * Using the bridge's own sessionId (not workingDir+sdkSessionId) as the key
+   * ensures each conversation gets its own subprocess — no cross-session bleed.
+   *
    * Reusing the same claude subprocess across messages eliminates the
    * cold-start cost (~0.6–1.4s) and avoids resending the full session
    * history on every turn.
    */
-  private sessions = new Map<string, SDKSession>();
+  private sessions = new Map<string, SessionEntry>();
+
+  /**
+   * Active stream controllers, keyed by bridge sessionId.
+   * Used by canUseTool to route permission_request events to the correct
+   * in-flight stream rather than the stale controller captured at session
+   * creation time.
+   */
+  private activeControllers = new Map<string, ReadableStreamDefaultController<string>>();
+
+  /** Interval handle for the TTL sweeper. */
+  private sweepTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(private pendingPerms: PendingPermissions, cliPath?: string, autoApprove = false) {
     this.cliPath = cliPath;
     this.autoApprove = autoApprove;
+    this.startSweeper();
+  }
+
+  /**
+   * Start the background TTL sweeper that closes sessions idle for > SESSION_TTL_MS.
+   */
+  private startSweeper(): void {
+    this.sweepTimer = setInterval(() => {
+      const now = Date.now();
+      for (const [key, entry] of this.sessions) {
+        if (now - entry.lastUsed > SESSION_TTL_MS) {
+          console.log(`[llm-provider] TTL expired for session ${key}, closing`);
+          this.evictSession(key);
+        }
+      }
+    }, SESSION_SWEEP_INTERVAL_MS);
+    // Don't keep the process alive just for the sweeper
+    if (this.sweepTimer.unref) this.sweepTimer.unref();
+  }
+
+  /** Stop the TTL sweeper and close all sessions. Useful for clean shutdown. */
+  destroy(): void {
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = undefined;
+    }
+    for (const key of [...this.sessions.keys()]) {
+      this.evictSession(key);
+    }
   }
 
   /**
    * Build the session options shared between createSession and resumeSession.
-   * `canUseTool` is bound to the controller passed in so permission requests
-   * stream back to the caller during the active turn.
+   *
+   * `canUseTool` dynamically looks up the active controller for the session
+   * so permission_request events are always routed to the current in-flight
+   * stream, not the stale controller captured at session creation time.
    */
   private buildSessionOptions(
     params: StreamChatParams,
-    controller: ReadableStreamDefaultController<string>,
   ): Record<string, unknown> {
     const pendingPerms = this.pendingPerms;
     const autoApprove = this.autoApprove;
+    const sessionId = params.sessionId;
+    const activeControllers = this.activeControllers;
     const cleanEnv = buildSubprocessEnv();
 
     let model = params.model;
@@ -478,6 +537,13 @@ export class SDKLLMProvider implements LLMProvider {
         if (autoApprove) {
           return { behavior: 'allow' as const, updatedInput: input };
         }
+        // Dynamically resolve the current active controller for this session.
+        // This is safe even when the session object is reused across turns.
+        const controller = activeControllers.get(sessionId);
+        if (!controller) {
+          console.warn(`[llm-provider] canUseTool: no active controller for session ${sessionId}, denying`);
+          return { behavior: 'deny' as const, message: 'No active stream to route permission request' };
+        }
         controller.enqueue(
           sseEvent('permission_request', {
             permissionRequestId: toolOpts.toolUseID,
@@ -501,58 +567,79 @@ export class SDKLLMProvider implements LLMProvider {
 
   /**
    * Get or create a persistent SDKSession for the given params.
+   *
+   * Key is the bridge sessionId — unique per conversation, never shared.
    * On first call: resumes the existing SDK session if `sdkSessionId` is set,
    * otherwise creates a fresh one. On subsequent calls: returns the cached session.
    */
   private getOrCreateSession(
     sessionKey: string,
     params: StreamChatParams,
-    controller: ReadableStreamDefaultController<string>,
   ): SDKSession {
     const existing = this.sessions.get(sessionKey);
-    if (existing) return existing;
+    if (existing) {
+      existing.lastUsed = Date.now();
+      return existing.session;
+    }
 
-    const opts = this.buildSessionOptions(params, controller);
+    const opts = this.buildSessionOptions(params);
 
     let session: SDKSession;
     if (params.sdkSessionId) {
-      console.log(`[llm-provider] Resuming persistent session ${params.sdkSessionId}`);
+      console.log(`[llm-provider] Resuming persistent session ${params.sdkSessionId} (key: ${sessionKey})`);
       session = unstable_v2_resumeSession(
         params.sdkSessionId,
         opts as Parameters<typeof unstable_v2_resumeSession>[1],
       );
     } else {
-      console.log('[llm-provider] Creating new persistent session');
+      console.log(`[llm-provider] Creating new persistent session (key: ${sessionKey})`);
       session = unstable_v2_createSession(
         opts as Parameters<typeof unstable_v2_createSession>[0],
       );
     }
 
-    this.sessions.set(sessionKey, session);
+    this.sessions.set(sessionKey, { session, lastUsed: Date.now() });
     return session;
   }
 
   /** Remove a session from the cache and close it. */
   private evictSession(sessionKey: string): void {
-    const s = this.sessions.get(sessionKey);
-    if (s) {
+    const entry = this.sessions.get(sessionKey);
+    if (entry) {
       this.sessions.delete(sessionKey);
-      try { s.close(); } catch { /* ignore */ }
+      try { entry.session.close(); } catch { /* ignore */ }
     }
   }
 
+  /**
+   * Pre-warm a session for the given params so the first real message
+   * arrives to an already-running subprocess (zero cold-start).
+   *
+   * Safe to call multiple times — no-op if the session already exists.
+   */
+  warmUp(params: StreamChatParams): void {
+    const sessionKey = params.sessionId;
+    if (this.sessions.has(sessionKey)) return;
+    console.log(`[llm-provider] Pre-warming session for key: ${sessionKey}`);
+    this.getOrCreateSession(sessionKey, params);
+  }
+
   streamChat(params: StreamChatParams): ReadableStream<string> {
-    // Key combines workingDir + sdkSessionId so different sessions / CWDs
-    // never share a process.
-    const sessionKey = `${params.workingDirectory ?? ''}|${params.sdkSessionId ?? ''}`;
+    // Key is the bridge sessionId — unique per conversation, never shared across users/channels.
+    const sessionKey = params.sessionId;
 
     return new ReadableStream({
       start: (controller) => {
         (async () => {
           const state: StreamState = { hasReceivedResult: false, hasStreamedText: false, lastAssistantText: '' };
 
+          // Register this controller as the active one for the session.
+          // canUseTool will look it up dynamically to route permission_request
+          // events to the correct in-flight stream.
+          this.activeControllers.set(sessionKey, controller);
+
           try {
-            let session = this.getOrCreateSession(sessionKey, params, controller);
+            const session = this.getOrCreateSession(sessionKey, params);
 
             const prompt = buildPrompt(params.prompt, params.files);
             // For multi-modal prompts the SDK accepts an SDKUserMessage; for
@@ -573,11 +660,13 @@ export class SDKLLMProvider implements LLMProvider {
               controller.enqueue(sseEvent('text', state.lastAssistantText));
             }
 
+            this.activeControllers.delete(sessionKey);
             controller.close();
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             console.error('[llm-provider] SDK session error:', err instanceof Error ? err.stack || err.message : err);
 
+            this.activeControllers.delete(sessionKey);
             // Evict the broken session so the next message gets a fresh one.
             this.evictSession(sessionKey);
 
